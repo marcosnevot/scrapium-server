@@ -48,26 +48,26 @@ async def scrape(req: ScrapeRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-
 @app.websocket("/ws/scrape")
 async def websocket_scrape(ws: WebSocket):
     await ws.accept()
     try:
-        # 1) Recibimos y validamos URL
         data = await ws.receive_json()
         url = ScrapeRequest(url=data["url"]).url
 
-        # 2) Capturamos el loop principal y preparamos la cola
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, int]|tuple[str,str]] = asyncio.Queue()
 
-        # 3) Worker que produce (tier,stock) y luego un sentinel "__complete__"
+        scraper = EntradiumScraper(url, headless=True)
+
+        # Nueva línea: Enviar event_info inicialmente
+        event_info = scraper._scrape_event_info()
+        await ws.send_json({"event_info": event_info})
+
         def worker():
             try:
-                scraper = EntradiumScraper(url, headless=True)
                 for tier, stock in scraper.run_stream():
                     loop.call_soon_threadsafe(queue.put_nowait, (tier, stock))
-                # tras acabar todas las tandas:
                 loop.call_soon_threadsafe(queue.put_nowait, ("__complete__", ""))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
@@ -75,7 +75,6 @@ async def websocket_scrape(ws: WebSocket):
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        # 4) Consumir cola y enviar por WS hasta recibir el sentinel
         while True:
             key, val = await queue.get()
             if key == "__error__":
@@ -84,14 +83,12 @@ async def websocket_scrape(ws: WebSocket):
             if key == "__complete__":
                 await ws.send_json({"__complete__": True})
                 break
-            # mensaje normal de actualizacion
             await ws.send_json({"tier": key, "stock": val})
 
     except WebSocketDisconnect:
         pass
     finally:
         await ws.close()
-
 
 if __name__ == "__main__":
     import uvicorn
