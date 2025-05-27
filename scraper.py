@@ -1,12 +1,12 @@
-# scraper.py
-
 from __future__ import annotations
+import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,7 +32,10 @@ class EntradiumScraper:
         self.url = url
         self.timeout = timeout
 
-        opts = webdriver.ChromeOptions()
+        # --- Configurar ChromeOptions apuntando a Chromium del contenedor
+        opts = Options()
+        # Ruta al binario de Chromium, definida en el Dockerfile como ENV CHROME_BIN
+        opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
         if headless:
             opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
@@ -40,7 +43,8 @@ class EntradiumScraper:
         opts.add_argument("--disable-dev-shm-usage")
 
         self.driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()), options=opts
+            service=Service(ChromeDriverManager().install()),
+            options=opts
         )
         self.wait = WebDriverWait(self.driver, timeout)
 
