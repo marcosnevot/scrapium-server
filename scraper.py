@@ -170,8 +170,8 @@ class EntradiumScraper:
     def _scrape_event_info(self) -> Dict[str, str]:
         self.driver.get(self.url)
         event_title = self.driver.find_element(By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy").text.strip()
-        date = self.driver.find_element(By.CSS_SELECTOR, ".text-raro .icon-calendar + span").text.strip()
-        time_event = self.driver.find_element(By.CSS_SELECTOR, ".text-raro .icon-clock + span").text.strip()
+        date = self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar").find_element(By.XPATH, "../../span[2]").text.strip()        
+        time_event = self.driver.find_element(By.CSS_SELECTOR, ".icon-clock").find_element(By.XPATH, "../../span[2]").text.strip()
         organizer = self.driver.find_element(By.CSS_SELECTOR, ".organizer").text.strip()
         return {
             "title": event_title,
