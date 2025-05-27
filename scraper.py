@@ -1,4 +1,3 @@
-# scraper.py
 from __future__ import annotations
 import os
 import time
@@ -44,31 +43,27 @@ class EntradiumScraper:
         self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, timeout)
 
-    def run(self) -> Dict[str, int]:
-        """
-        API existing: devuelve todos los resultados al final.
-        """
+    def run(self) -> Dict[str, any]:
+        event_info = self._scrape_event_info()
         resultados: Dict[str, int] = {}
         for tier in self._discover_tiers():
             tier.stock = (self._count_stock_for_tier(tier.id_) if tier.id_ else 0)
             resultados[tier.name] = tier.stock
         self.driver.quit()
-        return resultados
+        return {
+            "event_info": event_info,
+            "tickets": resultados
+        }
 
     def run_stream(self) -> Generator[Tuple[str, int], None, None]:
-        """
-        Streaming: yield (tier_name, running_stock) cada vez que se actualice
-        """
         tiers = self._discover_tiers()
         for tier in tiers:
             name = tier.name
             if not tier.id_:
-                # agotada desde el inicio
                 yield name, 0
                 continue
 
             stock = 0
-            # mientras haya opciones positivas
             while True:
                 self.driver.get(self.url)
                 try:
@@ -111,7 +106,6 @@ class EntradiumScraper:
                 yield name, stock
                 time.sleep(0.25)
 
-            # Al acabar la tanda, aseguramos última notificación
             yield name, stock
 
         self.driver.quit()
@@ -134,7 +128,6 @@ class EntradiumScraper:
         return tiers
 
     def _count_stock_for_tier(self, select_id: str) -> int:
-        # Mismo código anterior, no se usa en streaming
         stock = 0
         while True:
             self.driver.get(self.url)
@@ -173,3 +166,16 @@ class EntradiumScraper:
             stock += qty
             time.sleep(0.25)
         return stock
+
+    def _scrape_event_info(self) -> Dict[str, str]:
+        self.driver.get(self.url)
+        event_title = self.driver.find_element(By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy").text.strip()
+        date = self.driver.find_element(By.CSS_SELECTOR, ".text-raro .icon-calendar + span").text.strip()
+        time_event = self.driver.find_element(By.CSS_SELECTOR, ".text-raro .icon-clock + span").text.strip()
+        organizer = self.driver.find_element(By.CSS_SELECTOR, ".organizer").text.strip()
+        return {
+            "title": event_title,
+            "date": date,
+            "time": time_event,
+            "organizer": organizer
+        }

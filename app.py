@@ -37,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/scrape", response_model=dict[str,int])
+@app.post("/scrape", response_model=dict)
 async def scrape(req: ScrapeRequest):
     try:
         loop = asyncio.get_event_loop()
