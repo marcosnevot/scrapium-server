@@ -1,5 +1,3 @@
-# app.py
-
 import sys
 import os
 import pathlib
@@ -55,14 +53,15 @@ async def scrape(req: ScrapeRequest):
 async def websocket_scrape(ws: WebSocket):
     await ws.accept()
     try:
-        # 1) Recibimos y validamos la URL
+        # Recibimos y validamos URL
         data = await ws.receive_json()
         url = ScrapeRequest(url=data["url"]).url
-        # 2) Capturamos el loop principal y creamos la cola
+
+        # Preparamos cola y capturamos el loop
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, int]|tuple[str,str]] = asyncio.Queue()
 
-        # 3) Worker en hilo para run_stream, enviando al queue vía loop
+        # Hilo que produce (tier,stock)
         def worker():
             try:
                 scraper = EntradiumScraper(url, headless=True)
@@ -74,7 +73,7 @@ async def websocket_scrape(ws: WebSocket):
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        # 4) Consumir la cola y enviar al cliente
+        # Consumir hasta finalizar
         while True:
             tier, val = await queue.get()
             if tier == "__error__":
@@ -83,12 +82,12 @@ async def websocket_scrape(ws: WebSocket):
 
             await ws.send_json({"tier": tier, "stock": val})
 
-            # Si el hilo finalizó y la cola está vacía, salimos
             if not thread.is_alive() and queue.empty():
+                # Mensaje explícito de finalización
+                await ws.send_json({"__complete__": True})
                 break
 
     except WebSocketDisconnect:
-        # Cliente cerró antes de acabar
         pass
     finally:
         await ws.close()
