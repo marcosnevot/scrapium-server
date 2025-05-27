@@ -56,11 +56,10 @@ async def websocket_scrape(ws: WebSocket):
         url = ScrapeRequest(url=data["url"]).url
 
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, int]|tuple[str,str]] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[str, int] | tuple[str, str]] = asyncio.Queue()
 
         scraper = EntradiumScraper(url, headless=True)
 
-        # Nueva línea: Enviar event_info inicialmente
         event_info = scraper._scrape_event_info()
         await ws.send_json({"event_info": event_info})
 
@@ -72,8 +71,7 @@ async def websocket_scrape(ws: WebSocket):
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
 
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+        threading.Thread(target=worker, daemon=True).start()
 
         while True:
             key, val = await queue.get()
@@ -83,12 +81,22 @@ async def websocket_scrape(ws: WebSocket):
             if key == "__complete__":
                 await ws.send_json({"__complete__": True})
                 break
-            await ws.send_json({"tier": key, "stock": val})
+
+            # Manejo explícito de la desconexión del cliente:
+            try:
+                await ws.send_json({"tier": key, "stock": val})
+            except WebSocketDisconnect:
+                print("Cliente desconectado, cerrando scraping.")
+                break
 
     except WebSocketDisconnect:
-        pass
+        print("Cliente desconectado inesperadamente.")
     finally:
-        await ws.close()
+        try:
+            await ws.close()
+        except:
+            pass  # Asegurarse de que ws.close() no cause errores adicionales
+
 
 if __name__ == "__main__":
     import uvicorn
