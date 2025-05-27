@@ -1,3 +1,5 @@
+# scraper.py
+
 from __future__ import annotations
 import os
 import time
@@ -13,7 +15,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     NoSuchElementException, TimeoutException, ElementClickInterceptedException
 )
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 @dataclass
@@ -32,9 +33,8 @@ class EntradiumScraper:
         self.url = url
         self.timeout = timeout
 
-        # --- Configurar ChromeOptions apuntando a Chromium del contenedor
+        # 1) Configuramos Options apuntando a Chromium
         opts = Options()
-        # Ruta al binario de Chromium, definida en el Dockerfile como ENV CHROME_BIN
         opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
         if headless:
             opts.add_argument("--headless=new")
@@ -42,19 +42,22 @@ class EntradiumScraper:
         opts.add_argument("--disable-gpu")
         opts.add_argument("--disable-dev-shm-usage")
 
-        self.driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()),
-            options=opts
+        # 2) Usamos el chromedriver del sistema
+        chromedriver_path = os.environ.get(
+            "CHROMEDRIVER_PATH", "/usr/bin/chromedriver"
         )
+        service = Service(executable_path=chromedriver_path)
+
+        # 3) Iniciamos el driver
+        self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, timeout)
 
     def run(self) -> Dict[str, int]:
-        """
-        Devuelve un dict {nombre_tanda: stock} para la URL configurada.
-        """
         resultados: Dict[str, int] = {}
         for tier in self._discover_tiers():
-            tier.stock = self._count_stock_for_tier(tier.id_) if tier.id_ else 0
+            tier.stock = (
+                self._count_stock_for_tier(tier.id_) if tier.id_ else 0
+            )
             resultados[tier.name] = tier.stock
         self.driver.quit()
         return resultados
@@ -62,18 +65,19 @@ class EntradiumScraper:
     def _discover_tiers(self) -> List[TicketTier]:
         self.driver.get(self.url)
         tiers: List[TicketTier] = []
-
         for ticket in self.driver.find_elements(By.CSS_SELECTOR, self.TICKET_CSS):
             try:
-                price_el = ticket.find_element(By.CSS_SELECTOR, ".ticket-price span")
+                price_el = ticket.find_element(
+                    By.CSS_SELECTOR, ".ticket-price span"
+                )
                 price_text = price_el.text.strip().replace("€", "").strip()
                 price_int = price_text.split(",")[0]
                 name = f"Entradas de {price_int}€"
             except NoSuchElementException:
                 name = "Tanda sin precio"
 
-            sel_elems = ticket.find_elements(By.CSS_SELECTOR, self.SELECT_CSS)
-            sel_id = sel_elems[0].get_attribute("id") if sel_elems else None
+            sel = ticket.find_elements(By.CSS_SELECTOR, self.SELECT_CSS)
+            sel_id = sel[0].get_attribute("id") if sel else None
             tiers.append(TicketTier(id_=sel_id, name=name))
         return tiers
 
@@ -90,9 +94,9 @@ class EntradiumScraper:
 
             select = Select(sel_el)
             opt_vals = [
-                int(opt.get_attribute("value"))
-                for opt in select.options
-                if (v := opt.get_attribute("value")).isdigit() and int(v) > 0
+                int(o.get_attribute("value"))
+                for o in select.options
+                if (v := o.get_attribute("value")).isdigit() and int(v) > 0
             ]
             if not opt_vals:
                 break
@@ -105,7 +109,9 @@ class EntradiumScraper:
 
             try:
                 btn = self.wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS))
+                    EC.element_to_be_clickable(
+                        (By.CSS_SELECTOR, self.BTN_CSS)
+                    )
                 )
                 self.driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center'});", btn
@@ -113,7 +119,9 @@ class EntradiumScraper:
                 try:
                     btn.click()
                 except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", btn)
+                    self.driver.execute_script(
+                        "arguments[0].click();", btn
+                    )
             except TimeoutException:
                 break
 
