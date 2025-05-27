@@ -53,39 +53,39 @@ async def scrape(req: ScrapeRequest):
 async def websocket_scrape(ws: WebSocket):
     await ws.accept()
     try:
-        # Recibimos y validamos URL
+        # 1) Recibimos y validamos URL
         data = await ws.receive_json()
         url = ScrapeRequest(url=data["url"]).url
 
-        # Preparamos cola y capturamos el loop
+        # 2) Capturamos el loop principal y preparamos la cola
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, int]|tuple[str,str]] = asyncio.Queue()
 
-        # Hilo que produce (tier,stock)
+        # 3) Worker que produce (tier,stock) y luego un sentinel "__complete__"
         def worker():
             try:
                 scraper = EntradiumScraper(url, headless=True)
                 for tier, stock in scraper.run_stream():
                     loop.call_soon_threadsafe(queue.put_nowait, (tier, stock))
+                # tras acabar todas las tandas:
+                loop.call_soon_threadsafe(queue.put_nowait, ("__complete__", ""))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
-        # Consumir hasta finalizar
+        # 4) Consumir cola y enviar por WS hasta recibir el sentinel
         while True:
-            tier, val = await queue.get()
-            if tier == "__error__":
+            key, val = await queue.get()
+            if key == "__error__":
                 await ws.send_json({"__error__": val})
                 break
-
-            await ws.send_json({"tier": tier, "stock": val})
-
-            if not thread.is_alive() and queue.empty():
-                # Mensaje explícito de finalización
+            if key == "__complete__":
                 await ws.send_json({"__complete__": True})
                 break
+            # mensaje normal de actualizacion
+            await ws.send_json({"tier": key, "stock": val})
 
     except WebSocketDisconnect:
         pass
