@@ -129,8 +129,6 @@ class EntradiumScraper:
 
         self.driver.quit()
 
-    self.driver.quit()
-
     def _discover_tiers(self) -> List[TicketTier]:
         self.driver.get(self.url)
         tiers: List[TicketTier] = []
