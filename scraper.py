@@ -60,72 +60,74 @@ class EntradiumScraper:
             "tickets": resultados
         }
 
-    def run_stream(self) -> Generator[Tuple[str, int], None, None]:
+    def run_stream(self) -> Generator[tuple[str, int], None, None]:
         """
         Streaming: yield (tier_name, running_stock) cada vez que se actualice,
-        y comprueba stop_event para cancelar.
+        pero se detiene inmediatamente si scraper.stop_event.is_set().
         """
-    tiers = self._discover_tiers()
-    for tier in tiers:
-        # Si se ha pedido cancelación, dejamos de scrapear
-        if getattr(self, "stop_event", None) and self.stop_event.is_set():
-            break
-
-        name = tier.name
-        if not tier.id_:
-            # agotada desde el inicio
-            yield name, 0
-            continue
-
-        stock = 0
-        while True:
-            # Chequeo de cancelación en cada iteración
+        tiers = self._discover_tiers()
+        for tier in tiers:
+            # parada inmediata si se solicitó cancelación
             if getattr(self, "stop_event", None) and self.stop_event.is_set():
                 break
 
-            self.driver.get(self.url)
-            try:
-                sel_el = self.wait.until(
-                    EC.presence_of_element_located((By.ID, tier.id_))
-                )
-            except TimeoutException:
-                break
+            name = tier.name
+            if not tier.id_:
+                yield name, 0
+                continue
 
-            select = Select(sel_el)
-            opt_vals = [
-                int(o.get_attribute("value"))
-                for o in select.options
-            if (v := o.get_attribute("value")).isdigit() and int(v) > 0
-            ]
-            if not opt_vals:
-                break
+            stock = 0
+            while True:
+                if getattr(self, "stop_event", None) and self.stop_event.is_set():
+                    break
 
-            qty = max(opt_vals)
-            try:
-                select.select_by_value(str(qty))
-            except Exception:
-                break
-
-            try:
-                btn = self.wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS))
-                )
-                self.driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", btn
-                )
+                self.driver.get(self.url)
                 try:
-                    btn.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", btn)
-            except TimeoutException:
-                break
+                    sel_el = self.wait.until(
+                        EC.presence_of_element_located((By.ID, tier.id_))
+                    )
+                except TimeoutException:
+                    break
 
-            stock += qty
+                select = Select(sel_el)
+                # evitamos la expresión walrus para compatibilidad
+                opts = []
+                for opt in select.options:
+                    v = opt.get_attribute("value")
+                    if v.isdigit() and int(v) > 0:
+                        opts.append(int(v))
+                if not opts:
+                    break
+
+                qty = max(opts)
+                try:
+                    select.select_by_value(str(qty))
+                except Exception:
+                    break
+
+                try:
+                    btn = self.wait.until(
+                        EC.element_to_be_clickable(
+                            (By.CSS_SELECTOR, self.BTN_CSS))
+                    )
+                    self.driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", btn
+                    )
+                    try:
+                        btn.click()
+                    except ElementClickInterceptedException:
+                        self.driver.execute_script(
+                            "arguments[0].click();", btn)
+                except TimeoutException:
+                    break
+
+                stock += qty
+                yield name, stock
+                time.sleep(0.25)
+
             yield name, stock
-            time.sleep(0.25)
 
-        # Al acabar la tanda, aseguramos última notificación
-        yield name, stock
+        self.driver.quit()
 
     self.driver.quit()
 
@@ -148,8 +150,15 @@ class EntradiumScraper:
         return tiers
 
     def _count_stock_for_tier(self, select_id: str) -> int:
+        """
+        Conteo batch: igual que run_stream pero acumulado,
+        y también respeta scraper.stop_event.
+        """
         stock = 0
         while True:
+            if getattr(self, "stop_event", None) and self.stop_event.is_set():
+                break
+
             self.driver.get(self.url)
             try:
                 sel_el = self.wait.until(
@@ -157,19 +166,22 @@ class EntradiumScraper:
                 )
             except TimeoutException:
                 break
+
             select = Select(sel_el)
-            opt_vals = [
-                int(o.get_attribute("value"))
-                for o in select.options
-                if (v := o.get_attribute("value")).isdigit() and int(v) > 0
-            ]
-            if not opt_vals:
+            opts = []
+            for opt in select.options:
+                v = opt.get_attribute("value")
+                if v.isdigit() and int(v) > 0:
+                    opts.append(int(v))
+            if not opts:
                 break
-            qty = max(opt_vals)
+
+            qty = max(opts)
             try:
                 select.select_by_value(str(qty))
             except Exception:
                 break
+
             try:
                 btn = self.wait.until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS))
@@ -183,8 +195,10 @@ class EntradiumScraper:
                     self.driver.execute_script("arguments[0].click();", btn)
             except TimeoutException:
                 break
+
             stock += qty
             time.sleep(0.25)
+
         return stock
 
     def _scrape_event_info(self) -> Dict[str, str]:
