@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generator, List, Optional, Tuple
-import threading  # para usar Event
+import threading
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -32,11 +32,11 @@ class EntradiumScraper:
         url: str,
         headless: bool = True,
         timeout: int = 10,
-        stop_event: threading.Event | None = None  # *** CANCELATION SUPPORT ***
+        stop_event: threading.Event | None = None
     ) -> None:
         self.url = url
         self.timeout = timeout
-        self.stop_event = stop_event  # *** CANCELATION SUPPORT ***
+        self.stop_event = stop_event
 
         opts = Options()
         opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
@@ -52,34 +52,72 @@ class EntradiumScraper:
         self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, timeout)
 
-    def run(self) -> Dict[str, any]:
-        event_info = self._scrape_event_info()
-        resultados: Dict[str, int] = {}
-        for tier in self._discover_tiers():
-            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
-                break
-            tier.stock = (self._count_stock_for_tier(tier.id_) if tier.id_ else 0)
-            resultados[tier.name] = tier.stock
-        self.driver.quit()
+    def _scrape_event_info(self) -> Dict[str, str]:
+        """Extrae título, fecha, hora y organizador del evento."""
+        self.driver.get(self.url)
+
+        # Título
+        title_el = self.driver.find_element(
+            By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy"
+        )
+        event_title = title_el.text.strip()
+
+        # Fecha: icon-calendar -> padre <span class="me-3"> -> siguiente hermano <span>fecha</span>
+        cal_icon = self.driver.find_element(By.CSS_SELECTOR, "i.icon-calendar")
+        date = cal_icon.find_element(
+            By.XPATH, "./parent::span/following-sibling::span"
+        ).text.strip()
+
+        # Hora: icon-clock -> padre <span> -> siguiente hermano <span>hora</span>
+        clock_icon = self.driver.find_element(By.CSS_SELECTOR, "i.icon-clock")
+        time_event = clock_icon.find_element(
+            By.XPATH, "./parent::span/following-sibling::span"
+        ).text.strip()
+
+        # Organizador
+        organizer_el = self.driver.find_element(By.CSS_SELECTOR, "a.organizer")
+        organizer = organizer_el.text.strip()
+
         return {
-            "event_info": event_info,
-            "tickets": resultados
+            "title": event_title,
+            "date": date,
+            "time": time_event,
+            "organizer": organizer
         }
 
+    def _discover_tiers(self) -> List[TicketTier]:
+        """Detecta todas las tandas (tiers) en la página."""
+        self.driver.get(self.url)
+        tiers: List[TicketTier] = []
+        for ticket in self.driver.find_elements(By.CSS_SELECTOR, self.TICKET_CSS):
+            try:
+                price_el = ticket.find_element(By.CSS_SELECTOR, ".ticket-price span")
+                price_text = price_el.text.strip().replace("€", "").strip()
+                price_int = price_text.split(",")[0]
+                name = f"Entradas de {price_int}€"
+            except NoSuchElementException:
+                name = "Tanda sin precio"
+
+            sel = ticket.find_elements(By.CSS_SELECTOR, self.SELECT_CSS)
+            sel_id = sel[0].get_attribute("id") if sel else None
+            tiers.append(TicketTier(id_=sel_id, name=name))
+        return tiers
+
     def run_stream(self) -> Generator[Tuple[str, int], None, None]:
+        """Generador que va devolviendo (tier_name, stock) incrementalmente."""
         tiers = self._discover_tiers()
         for tier in tiers:
-            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+            if self.stop_event and self.stop_event.is_set():
                 break
 
-            name = tier.name
+            # Tandas sin selector (agotadas desde el inicio)
             if not tier.id_:
-                yield name, 0
+                yield tier.name, 0
                 continue
 
             stock = 0
             while True:
-                if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                if self.stop_event and self.stop_event.is_set():
                     break
 
                 self.driver.get(self.url)
@@ -120,34 +158,32 @@ class EntradiumScraper:
                     break
 
                 stock += qty
-                yield name, stock
+                yield tier.name, stock
                 time.sleep(0.25)
 
-            yield name, stock
+            yield tier.name, stock
 
         self.driver.quit()
 
-    def _discover_tiers(self) -> List[TicketTier]:
-        self.driver.get(self.url)
-        tiers: List[TicketTier] = []
-        for ticket in self.driver.find_elements(By.CSS_SELECTOR, self.TICKET_CSS):
-            try:
-                price_el = ticket.find_element(By.CSS_SELECTOR, ".ticket-price span")
-                price_text = price_el.text.strip().replace("€", "").strip()
-                price_int = price_text.split(",")[0]
-                name = f"Entradas de {price_int}€"
-            except NoSuchElementException:
-                name = "Tanda sin precio"
-
-            sel = ticket.find_elements(By.CSS_SELECTOR, self.SELECT_CSS)
-            sel_id = sel[0].get_attribute("id") if sel else None
-            tiers.append(TicketTier(id_=sel_id, name=name))
-        return tiers
+    def run(self) -> Dict[str, any]:
+        """Método síncrono que devuelve toda la info al final."""
+        event_info = self._scrape_event_info()
+        resultados: Dict[str, int] = {}
+        for tier in self._discover_tiers():
+            if self.stop_event and self.stop_event.is_set():
+                break
+            tier.stock = self._count_stock_for_tier(tier.id_) if tier.id_ else 0
+            resultados[tier.name] = tier.stock
+        self.driver.quit()
+        return {
+            "event_info": event_info,
+            "tickets": resultados
+        }
 
     def _count_stock_for_tier(self, select_id: str) -> int:
         stock = 0
         while True:
-            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+            if self.stop_event and self.stop_event.is_set():
                 break
 
             self.driver.get(self.url)
@@ -182,24 +218,11 @@ class EntradiumScraper:
                 )
                 try:
                     btn.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", btn)
-            except TimeoutException:
-                break
+                    except ElementClickInterceptedException:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                except TimeoutException:
+                    break
 
             stock += qty
             time.sleep(0.25)
         return stock
-
-    def _scrape_event_info(self) -> Dict[str, str]:
-        self.driver.get(self.url)
-        event_title = self.driver.find_element(By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy").text.strip()
-        date = self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar").find_element(By.XPATH, "././span[2]").text.strip()        
-        time_event = self.driver.find_element(By.CSS_SELECTOR, ".icon-clock").find_element(By.XPATH, "././span[2]").text.strip()
-        organizer = self.driver.find_element(By.CSS_SELECTOR, ".organizer").text.strip()
-        return {
-            "title": event_title,
-            "date": date,
-            "time": time_event,
-            "organizer": organizer
-        }
