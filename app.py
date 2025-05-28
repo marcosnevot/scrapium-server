@@ -1,3 +1,4 @@
+# app.py
 import sys
 import os
 import pathlib
@@ -51,6 +52,8 @@ async def scrape(req: ScrapeRequest):
 @app.websocket("/ws/scrape")
 async def websocket_scrape(ws: WebSocket):
     await ws.accept()
+    # Creamos la bandera de cancelación
+    stop_event = threading.Event()  # *** CANCELATION SUPPORT ***
     try:
         data = await ws.receive_json()
         url = ScrapeRequest(url=data["url"]).url
@@ -58,23 +61,36 @@ async def websocket_scrape(ws: WebSocket):
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, int] | tuple[str, str]] = asyncio.Queue()
 
-        scraper = EntradiumScraper(url, headless=True)
+        # Pasamos stop_event al scraper
+        scraper = EntradiumScraper(url, headless=True, stop_event=stop_event)  # *** CANCELATION SUPPORT ***
 
+        # Primero enviamos la info del evento
         event_info = scraper._scrape_event_info()
         await ws.send_json({"event_info": event_info})
 
         def worker():
             try:
                 for tier, stock in scraper.run_stream():
+                    # Si stop_event fue señalizado, salimos
+                    if stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                        break
                     loop.call_soon_threadsafe(queue.put_nowait, (tier, stock))
-                loop.call_soon_threadsafe(queue.put_nowait, ("__complete__", ""))
+                # Solo enviamos COMPLETE si no cancelamos
+                if not stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                    loop.call_soon_threadsafe(queue.put_nowait, ("__complete__", ""))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
 
-        threading.Thread(target=worker, daemon=True).start()
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
+        # Enviar tandas hasta completion o error
         while True:
-            key, val = await queue.get()
+            try:
+                key, val = await queue.get()
+            except asyncio.CancelledError:
+                break
+
             if key == "__error__":
                 await ws.send_json({"__error__": val})
                 break
@@ -82,21 +98,23 @@ async def websocket_scrape(ws: WebSocket):
                 await ws.send_json({"__complete__": True})
                 break
 
-            # Manejo explícito de la desconexión del cliente:
             try:
                 await ws.send_json({"tier": key, "stock": val})
             except WebSocketDisconnect:
-                print("Cliente desconectado, cerrando scraping.")
+                # Señalizamos cancelación y salimos
+                stop_event.set()  # *** CANCELATION SUPPORT ***
                 break
 
     except WebSocketDisconnect:
-        print("Cliente desconectado inesperadamente.")
+        # Cliente cerró sin enviar más mensajes
+        stop_event.set()  # *** CANCELATION SUPPORT ***
     finally:
+        # Asegurarnos de cerrar socket y señalizar cancel
+        stop_event.set()  # *** CANCELATION SUPPORT ***
         try:
             await ws.close()
         except:
-            pass  # Asegurarse de que ws.close() no cause errores adicionales
-
+            pass
 
 if __name__ == "__main__":
     import uvicorn

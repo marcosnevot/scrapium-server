@@ -1,8 +1,10 @@
+# scraper.py
 from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Generator, List, Optional, Tuple
+import threading  # para usar Event
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -25,9 +27,16 @@ class EntradiumScraper:
     SELECT_CSS = "select[id^='tickets_ticket_list'][id$='_qty']"
     TICKET_CSS = "div.ticket"
 
-    def __init__(self, url: str, headless: bool = True, timeout: int = 10) -> None:
+    def __init__(
+        self,
+        url: str,
+        headless: bool = True,
+        timeout: int = 10,
+        stop_event: threading.Event | None = None  # *** CANCELATION SUPPORT ***
+    ) -> None:
         self.url = url
         self.timeout = timeout
+        self.stop_event = stop_event  # *** CANCELATION SUPPORT ***
 
         opts = Options()
         opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
@@ -47,6 +56,8 @@ class EntradiumScraper:
         event_info = self._scrape_event_info()
         resultados: Dict[str, int] = {}
         for tier in self._discover_tiers():
+            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                break
             tier.stock = (self._count_stock_for_tier(tier.id_) if tier.id_ else 0)
             resultados[tier.name] = tier.stock
         self.driver.quit()
@@ -58,6 +69,9 @@ class EntradiumScraper:
     def run_stream(self) -> Generator[Tuple[str, int], None, None]:
         tiers = self._discover_tiers()
         for tier in tiers:
+            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                break
+
             name = tier.name
             if not tier.id_:
                 yield name, 0
@@ -65,6 +79,9 @@ class EntradiumScraper:
 
             stock = 0
             while True:
+                if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                    break
+
                 self.driver.get(self.url)
                 try:
                     sel_el = self.wait.until(
@@ -130,6 +147,9 @@ class EntradiumScraper:
     def _count_stock_for_tier(self, select_id: str) -> int:
         stock = 0
         while True:
+            if self.stop_event and self.stop_event.is_set():  # *** CANCELATION SUPPORT ***
+                break
+
             self.driver.get(self.url)
             try:
                 sel_el = self.wait.until(
@@ -137,6 +157,7 @@ class EntradiumScraper:
                 )
             except TimeoutException:
                 break
+
             select = Select(sel_el)
             opt_vals = [
                 int(o.get_attribute("value"))
@@ -145,11 +166,13 @@ class EntradiumScraper:
             ]
             if not opt_vals:
                 break
+
             qty = max(opt_vals)
             try:
                 select.select_by_value(str(qty))
             except Exception:
                 break
+
             try:
                 btn = self.wait.until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS))
@@ -163,6 +186,7 @@ class EntradiumScraper:
                     self.driver.execute_script("arguments[0].click();", btn)
             except TimeoutException:
                 break
+
             stock += qty
             time.sleep(0.25)
         return stock
@@ -170,8 +194,8 @@ class EntradiumScraper:
     def _scrape_event_info(self) -> Dict[str, str]:
         self.driver.get(self.url)
         event_title = self.driver.find_element(By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy").text.strip()
-        date = self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar").find_element(By.XPATH, "../../span[2]").text.strip()        
-        time_event = self.driver.find_element(By.CSS_SELECTOR, ".icon-clock").find_element(By.XPATH, "../../span[2]").text.strip()
+        date = self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar").find_element(By.XPATH, "././span[2]").text.strip()        
+        time_event = self.driver.find_element(By.CSS_SELECTOR, ".icon-clock").find_element(By.XPATH, "././span[2]").text.strip()
         organizer = self.driver.find_element(By.CSS_SELECTOR, ".organizer").text.strip()
         return {
             "title": event_title,
