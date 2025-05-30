@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, validator
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import websockets.exceptions
 
 from scraper import EntradiumScraper
 
@@ -57,68 +58,69 @@ async def scrape(req: ScrapeRequest):
 @app.websocket("/ws/scrape")
 async def websocket_scrape(ws: WebSocket):
     await ws.accept()
-    # Creamos un Event para señalizar cancelación
     stop_event = threading.Event()
     try:
         data = await ws.receive_json()
         url = ScrapeRequest(url=data["url"]).url
 
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, int] |
-                             tuple[str, str]] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[str, int] | tuple[str, str]] = asyncio.Queue()
 
-        # Instanciamos el scraper y le inyectamos el stop_event
         scraper = EntradiumScraper(url, headless=True)
         scraper.stop_event = stop_event
 
-        # 1) extraemos primero la info del evento
+        # 1) extraer y enviar event_info
         event_info = scraper._scrape_event_info()
-        await ws.send_json({"event_info": event_info})
+        try:
+            await ws.send_json({"event_info": event_info})
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosedOK):
+            stop_event.set()
+            return
 
-        # 2) lanzamos el worker de streaming en un hilo
+        # 2) worker thread streaming
         def worker():
             try:
                 for tier, stock in scraper.run_stream():
-                    # si el stop_event está señalado, cortamos aquí
                     if scraper.stop_event.is_set():
                         break
                     loop.call_soon_threadsafe(queue.put_nowait, (tier, stock))
-                # si no fue cancelado, enviamos el sentinel de complete
                 if not scraper.stop_event.is_set():
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("__complete__", ""))
+                    loop.call_soon_threadsafe(queue.put_nowait, ("__complete__", ""))
             except Exception as e:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, ("__error__", str(e)))
+                loop.call_soon_threadsafe(queue.put_nowait, ("__error__", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-        # 3) consumimos la cola y enviamos por WebSocket
+        # 3) consumir cola y enviar datos
         while True:
             key, val = await queue.get()
             if key == "__error__":
-                await ws.send_json({"__error__": val})
+                try:
+                    await ws.send_json({"__error__": val})
+                except Exception:
+                    pass
                 break
             if key == "__complete__":
-                await ws.send_json({"__complete__": True})
+                try:
+                    await ws.send_json({"__complete__": True})
+                except Exception:
+                    pass
                 break
 
+            # datos de tier
             try:
                 await ws.send_json({"tier": key, "stock": val})
-            except WebSocketDisconnect:
-                # el cliente cerró la conexión: señalizamos cancelación y salimos
+            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosedOK):
                 scraper.stop_event.set()
                 break
 
     except WebSocketDisconnect:
-        # desconexión inesperada: también señalizamos cancelación
         stop_event.set()
     finally:
-        # al salir, nos aseguramos de cerrar socket y señalizar cancelación
         stop_event.set()
         try:
             await ws.close()
-        except:
+        except Exception:
             pass
 
 
