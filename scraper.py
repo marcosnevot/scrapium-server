@@ -51,23 +51,18 @@ class EntradiumScraper:
         event_info = self._scrape_event_info()
         resultados: Dict[str, int] = {}
         for tier in self._discover_tiers():
-            tier.stock = (self._count_stock_for_tier(
-                tier.id_) if tier.id_ else 0)
+            tier.stock = (self._count_stock_for_tier(tier.id_) if tier.id_ else 0)
             resultados[tier.name] = tier.stock
         self.driver.quit()
-        return {
-            "event_info": event_info,
-            "tickets": resultados
-        }
+        return {"event_info": event_info, "tickets": resultados}
 
     def run_stream(self) -> Generator[tuple[str, int], None, None]:
-        """
-        Streaming: yield (tier_name, running_stock) cada vez que se actualice,
-        pero se detiene inmediatamente si scraper.stop_event.is_set().
-        """
+        # 1. Abrir página inicial en pestaña de control
+        self.driver.get(self.url)
+        control_handle = self.driver.current_window_handle
+
         tiers = self._discover_tiers()
         for tier in tiers:
-            # parada inmediata si se solicitó cancelación
             if getattr(self, "stop_event", None) and self.stop_event.is_set():
                 break
 
@@ -77,11 +72,17 @@ class EntradiumScraper:
                 continue
 
             stock = 0
+            reserve_handles: List[str] = []
+
+            # 2. Reservar en pestañas separadas
             while True:
                 if getattr(self, "stop_event", None) and self.stop_event.is_set():
                     break
 
+                # Volver a pestaña de control
+                self.driver.switch_to.window(control_handle)
                 self.driver.get(self.url)
+
                 try:
                     sel_el = self.wait.until(
                         EC.presence_of_element_located((By.ID, tier.id_))
@@ -90,43 +91,60 @@ class EntradiumScraper:
                     break
 
                 select = Select(sel_el)
-                # evitamos la expresión walrus para compatibilidad
-                opts = []
-                for opt in select.options:
-                    v = opt.get_attribute("value")
-                    if v.isdigit() and int(v) > 0:
-                        opts.append(int(v))
+                opts = [int(o.get_attribute("value")) for o in select.options if (v := o.get_attribute("value")).isdigit() and int(v) > 0]
                 if not opts:
                     break
 
                 qty = max(opts)
-                try:
-                    select.select_by_value(str(qty))
-                except Exception:
-                    break
+                # Abrir nueva pestaña para reserva
+                self.driver.execute_script("window.open('');")
+                new_handle = [h for h in self.driver.window_handles if h != control_handle and h not in reserve_handles][-1]
+                self.driver.switch_to.window(new_handle)
+                self.driver.get(self.url)
 
+                # Seleccionar y reservar
+                sel2 = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
+                Select(sel2).select_by_value(str(qty))
+                btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS)))
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 try:
-                    btn = self.wait.until(
-                        EC.element_to_be_clickable(
-                            (By.CSS_SELECTOR, self.BTN_CSS))
-                    )
-                    self.driver.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'});", btn
-                    )
-                    try:
-                        btn.click()
-                    except ElementClickInterceptedException:
-                        self.driver.execute_script(
-                            "arguments[0].click();", btn)
-                except TimeoutException:
-                    break
+                    btn.click()
+                except ElementClickInterceptedException:
+                    self.driver.execute_script("arguments[0].click();", btn)
 
                 stock += qty
                 yield name, stock
+                reserve_handles.append(new_handle)
                 time.sleep(0.25)
 
+            # 3. Cancelar todas las compras reservadas
+            for handle in reserve_handles:
+                self.driver.switch_to.window(handle)
+                try:
+                    # Click en enlace que abre el modal
+                    cancel_btn = self.wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-bs-target='#cancel-purchase-modal']"))
+                    )
+                    cancel_btn.click()
+                    # Esperar animación y hacer click en confirmación
+                    confirm_btn = self.wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "#cancel-purchase-modal .modal-footer a[rel='nofollow'][data-method='post']"))
+                    )
+                    confirm_btn.click()
+                    # Esperar a que el modal desaparezca
+                    self.wait.until(
+                        EC.invisibility_of_element_located((By.ID, "cancel-purchase-modal"))
+                    )
+                except TimeoutException:
+                    pass
+                # Cerrar pestaña
+                self.driver.close()
+
+            # Volver a pestaña de control
+            self.driver.switch_to.window(control_handle)
             yield name, stock
 
+        # 4. Cerrar navegador
         self.driver.quit()
 
     def _discover_tiers(self) -> List[TicketTier]:
