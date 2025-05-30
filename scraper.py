@@ -17,7 +17,7 @@ from selenium.common.exceptions import (
 )
 
 
-@dataclass
+dataclass
 class TicketTier:
     id_: Optional[str]
     name: str
@@ -45,38 +45,20 @@ class EntradiumScraper:
         self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, timeout)
 
-    def run(self) -> Dict[str, any]:
-        """
-        Batch mode: hace exactamente lo mismo que run_stream pero
-        devuelve un dict al final en lugar de hacer yield.
-        Atención: este modo también reservará entradas y
-        no las cancelará automáticamente.
-        """
-        info = self._scrape_event_info()
-        resultado: Dict[str, int] = {}
-        for tier in self._discover_tiers():
-            if not tier.id_:
-                resultado[tier.name] = 0
-                continue
-            # reutilizamos el método de streaming para contar y cancelar
-            total = 0
-            for _, stock in self._count_and_cancel_one_tier(tier):
-                total = stock
-            resultado[tier.name] = total
-        self.driver.quit()
-        return {"event_info": info, "tickets": resultado}
-
     def run_stream(self) -> Generator[tuple[str, int], None, None]:
         """
-        Streaming mode: por cada actualización emite (tier_name, stock_total).
-        Al final de cada tier, cancela todas las pestañas abiertas para liberar
-        las reservas y cierra el navegador al concluir todo.
+        Streaming mode: emite (tier, stock) para cada actualización.
+        Al finalizar el conteo de todos los tiers, emite '__complete__' antes de cancelar reservas.
         """
         # 1) pestaña de control
         self.driver.get(self.url)
         control = self.driver.current_window_handle
 
         tiers = self._discover_tiers()
+        # Lista maestra de todas las pestañas de reserva
+        all_reserve_handles: List[str] = []
+
+        # 2) Conteo por tiers
         for tier in tiers:
             if getattr(self, "stop_event", None) and self.stop_event.is_set():
                 break
@@ -89,12 +71,12 @@ class EntradiumScraper:
             stock = 0
             reserve_handles: List[str] = []
 
-            # 2) por cada tanda, abrir pestaña y reservar
+            # Abrir tantas pestañas como reservas hasta agotar stock
             while True:
                 if getattr(self, "stop_event", None) and self.stop_event.is_set():
                     break
 
-                # volvemos a pestaña principal y recargamos
+                # Volver a página inicial
                 self.driver.switch_to.window(control)
                 self.driver.get(self.url)
 
@@ -103,21 +85,23 @@ class EntradiumScraper:
                 except TimeoutException:
                     break
 
-                opts = [int(o.get_attribute("value")) for o in Select(sel).options
-                        if o.get_attribute("value").isdigit() and int(o.get_attribute("value")) > 0]
-                if not opts:
+                options = [
+                    int(opt.get_attribute("value")) for opt in Select(sel).options
+                    if opt.get_attribute("value").isdigit() and int(opt.get_attribute("value")) > 0
+                ]
+                if not options:
                     break
 
-                qty = max(opts)
+                qty = max(options)
 
-                # abrimos nueva pestaña
+                # Abrir nueva pestaña para reserva
                 self.driver.execute_script("window.open('');")
-                all_handles = self.driver.window_handles
-                new_handle = [h for h in all_handles if h != control and h not in reserve_handles][-1]
+                handles = self.driver.window_handles
+                new_handle = [h for h in handles if h != control and h not in reserve_handles][-1]
                 self.driver.switch_to.window(new_handle)
                 self.driver.get(self.url)
 
-                # seleccionamos y clicamos continuar
+                # Seleccionar y reservar
                 sel2 = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
                 Select(sel2).select_by_value(str(qty))
                 btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS)))
@@ -129,53 +113,55 @@ class EntradiumScraper:
 
                 stock += qty
                 reserve_handles.append(new_handle)
+                all_reserve_handles.append(new_handle)
                 yield name, stock
 
                 time.sleep(0.25)
 
-            # 3) cancelar todas las reservas abiertas
-            for handle in reserve_handles:
-                self.driver.switch_to.window(handle)
-                try:
-                    # abrir modal
-                    cancel_link = self.wait.until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-bs-target='#cancel-purchase-modal']"))
-                    )
-                    try:
-                        cancel_link.click()
-                    except ElementClickInterceptedException:
-                        self.driver.execute_script("arguments[0].click();", cancel_link)
-
-                    # esperar a que el modal sea visible
-                    self.wait.until(EC.visibility_of_element_located((By.ID, "cancel-purchase-modal")))
-
-                    # clicar el botón definitivo dentro del modal
-                    confirm = self.wait.until(
-                        EC.element_to_be_clickable((
-                            By.CSS_SELECTOR,
-                            "#cancel-purchase-modal .modal-footer a[rel='nofollow'][data-method='post']"
-                        ))
-                    )
-                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm)
-                    try:
-                        confirm.click()
-                    except ElementClickInterceptedException:
-                        self.driver.execute_script("arguments[0].click();", confirm)
-
-                    # esperar a que el modal desaparezca
-                    self.wait.until(EC.invisibility_of_element_located((By.ID, "cancel-purchase-modal")))
-                except (TimeoutException, NoSuchElementException):
-                    # si algo falla, seguimos con la siguiente pestaña
-                    pass
-                finally:
-                    # cerrar siempre la pestaña actual
-                    self.driver.close()
-
-            # devolvemos pestaña principal y emitimos stock final de este tier
-            self.driver.switch_to.window(control)
+            # Emitir stock final de este tier
             yield name, stock
 
-        # 4) fin de todo: cerramos el navegador
+        # 3) Señal de completado al frontend
+        yield "__complete__", ""
+
+        # 4) Cancelar todas las reservas tras completar
+        for handle in all_reserve_handles:
+            self.driver.switch_to.window(handle)
+            try:
+                # Abrir modal de cancelación
+                cancel_link = self.wait.until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-bs-target='#cancel-purchase-modal']"))
+                )
+                try:
+                    cancel_link.click()
+                except ElementClickInterceptedException:
+                    self.driver.execute_script("arguments[0].click();", cancel_link)
+
+                # Esperar aparición del modal
+                self.wait.until(EC.visibility_of_element_located((By.ID, "cancel-purchase-modal")))
+
+                # Confirmar cancelación
+                confirm = self.wait.until(
+                    EC.element_to_be_clickable((
+                        By.CSS_SELECTOR,
+                        "#cancel-purchase-modal .modal-footer a[rel='nofollow'][data-method='post']"
+                    ))
+                )
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm)
+                try:
+                    confirm.click()
+                except ElementClickInterceptedException:
+                    self.driver.execute_script("arguments[0].click();", confirm)
+
+                # Esperar cierre del modal
+                self.wait.until(EC.invisibility_of_element_located((By.ID, "cancel-purchase-modal")))
+            except (TimeoutException, NoSuchElementException):
+                pass
+            finally:
+                self.driver.close()
+
+        # 5) Volver y cerrar
+        self.driver.switch_to.window(control)
         self.driver.quit()
 
     def _discover_tiers(self) -> List[TicketTier]:
@@ -184,8 +170,8 @@ class EntradiumScraper:
         for ticket in self.driver.find_elements(By.CSS_SELECTOR, self.TICKET_CSS):
             try:
                 price_el = ticket.find_element(By.CSS_SELECTOR, ".ticket-price span")
-                price_int = price_el.text.strip().replace("€", "").split(",")[0]
-                name = f"Entradas de {price_int}€"
+                price_text = price_el.text.strip().replace("€", "").split(",")[0]
+                name = f"Entradas de {price_text}€"
             except NoSuchElementException:
                 name = "Tanda sin precio"
 
