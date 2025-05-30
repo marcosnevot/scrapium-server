@@ -16,13 +16,11 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException
 )
 
-
 @dataclass
 class TicketTier:
     id_: Optional[str]
     name: str
     stock: int = 0
-
 
 class EntradiumScraper:
     BTN_CSS = "button[type=submit].btn-dark:not([disabled])"
@@ -32,6 +30,7 @@ class EntradiumScraper:
     def __init__(self, url: str, headless: bool = True, timeout: int = 10) -> None:
         self.url = url
         self.timeout = timeout
+        self.stop_event = None  # Será asignado desde fuera (app.py)
 
         opts = Options()
         opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
@@ -45,10 +44,14 @@ class EntradiumScraper:
         self.driver = webdriver.Chrome(service=service, options=opts)
         self.wait = WebDriverWait(self.driver, timeout)
 
+    def set_stop_event(self, event) -> None:
+        """Inyecta el threading.Event para cancelación desde fuera"""
+        self.stop_event = event
+
     def run(self) -> Dict[str, any]:
         """
-        Modo batch: devuelve al final un dict con event_info y tickets.
-        (Este modo no cancela las reservas automáticamente.)
+        Modo batch: devuelve JSON con event_info y tickets.
+        No cancela reservas automáticamente.
         """
         event_info = self._scrape_event_info()
         resultados: Dict[str, int] = {}
@@ -62,8 +65,7 @@ class EntradiumScraper:
 
     def _count_stock_for_tier(self, select_id: str) -> int:
         """
-        Cuenta de forma síncrona todas las entradas de un tier
-        sin abrir pestañas extra ni cancelar reservas.
+        Cuenta de forma síncrona sin abrir pestañas extra ni cancelar reservas.
         """
         total = 0
         while True:
@@ -89,125 +91,135 @@ class EntradiumScraper:
 
     def run_stream(self) -> Generator[tuple[str, int], None, None]:
         """
-        Streaming mode: emite (tier, stock) cada vez que aumenta,
-        luego '__complete__' y finalmente cancela reservas.
+        Modo streaming: emite (tier, stock) en tiempo real,
+        luego '__complete__'; y en caso de interrupción o final,
+        cancela todas las reservas.
         """
-        # 1) Pestaña de control
+        # Pestaña de control inicial
         self.driver.get(self.url)
         control = self.driver.current_window_handle
 
         tiers = self._discover_tiers()
         all_reserve_handles: List[str] = []
 
-        # 2) Conteo por tiers abriendo pestañas
-        for tier in tiers:
-            if getattr(self, "stop_event", None) and self.stop_event.is_set():
-                break
-
-            name = tier.name
-            if not tier.id_:
-                yield name, 0
-                continue
-
-            stock = 0
-            reserve_handles: List[str] = []
-
-            while True:
-                if getattr(self, "stop_event", None) and self.stop_event.is_set():
+        try:
+            # Conteo por cada tier
+            for tier in tiers:
+                # Salir si se señala cancelación
+                if self.stop_event and self.stop_event.is_set():
                     break
 
-                # Volver a la pestaña principal y recargar
-                self.driver.switch_to.window(control)
-                self.driver.get(self.url)
+                name = tier.name
+                if not tier.id_:
+                    yield name, 0
+                    continue
 
-                try:
-                    sel = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
-                except TimeoutException:
-                    break
+                stock = 0
+                reserve_handles: List[str] = []
 
-                options = [
-                    int(opt.get_attribute("value")) for opt in Select(sel).options
-                    if opt.get_attribute("value").isdigit() and int(opt.get_attribute("value")) > 0
-                ]
-                if not options:
-                    break
+                while True:
+                    if self.stop_event and self.stop_event.is_set():
+                        break
 
-                qty = max(options)
+                    # Volver a la página principal
+                    self.driver.switch_to.window(control)
+                    self.driver.get(self.url)
 
-                # Abrimos nueva pestaña para reservar
-                self.driver.execute_script("window.open('');")
-                handles = self.driver.window_handles
-                new_handle = [h for h in handles if h != control and h not in reserve_handles][-1]
-                self.driver.switch_to.window(new_handle)
-                self.driver.get(self.url)
+                    try:
+                        sel = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
+                    except TimeoutException:
+                        break
 
-                # Seleccionar y reservar
-                sel2 = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
-                Select(sel2).select_by_value(str(qty))
-                btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS)))
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                try:
-                    btn.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", btn)
+                    # Opciones disponibles
+                    options = [
+                        int(opt.get_attribute("value")) for opt in Select(sel).options
+                        if opt.get_attribute("value").isdigit() and int(opt.get_attribute("value")) > 0
+                    ]
+                    if not options:
+                        break
 
-                stock += qty
-                reserve_handles.append(new_handle)
-                all_reserve_handles.append(new_handle)
+                    qty = max(options)
+
+                    # Abrir nueva pestaña y reservar
+                    self.driver.execute_script("window.open('');")
+                    handles = self.driver.window_handles
+                    new_handle = [h for h in handles if h != control and h not in reserve_handles][-1]
+                    self.driver.switch_to.window(new_handle)
+                    self.driver.get(self.url)
+
+                    sel2 = self.wait.until(EC.presence_of_element_located((By.ID, tier.id_)))
+                    Select(sel2).select_by_value(str(qty))
+                    btn = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.BTN_CSS)))
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    try:
+                        btn.click()
+                    except ElementClickInterceptedException:
+                        self.driver.execute_script("arguments[0].click();", btn)
+
+                    stock += qty
+                    reserve_handles.append(new_handle)
+                    all_reserve_handles.append(new_handle)
+                    yield name, stock
+
+                    time.sleep(0.25)
+
+                # Emitir stock final de este tier
                 yield name, stock
 
-                time.sleep(0.25)
+            # Señal de completado al frontend
+            yield "__complete__", ""
 
-            # Emitir total final de este tier
-            yield name, stock
+        finally:
+            # Cancelar todas las reservas iniciadas (tanto tras normal como interrupción)
+            for handle in all_reserve_handles:
+                try:
+                    self.driver.switch_to.window(handle)
 
-        # 3) Señal de completado al frontend
-        yield "__complete__", ""
+                    # Abrir modal de cancelación
+                    cancel_link = self.wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-bs-target='#cancel-purchase-modal']"))
+                    )
+                    try:
+                        cancel_link.click()
+                    except ElementClickInterceptedException:
+                        self.driver.execute_script("arguments[0].click();", cancel_link)
 
-        # 4) Cancelar reservas en todas las pestañas abiertas
-        for handle in all_reserve_handles:
-            self.driver.switch_to.window(handle)
+                    # Esperar aparición del modal
+                    self.wait.until(EC.visibility_of_element_located((By.ID, "cancel-purchase-modal")))
+
+                    # Confirmar cancelación
+                    confirm = self.wait.until(
+                        EC.element_to_be_clickable((
+                            By.CSS_SELECTOR,
+                            "#cancel-purchase-modal .modal-footer a[rel='nofollow'][data-method='post']"
+                        ))
+                    )
+                    self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm)
+                    try:
+                        confirm.click()
+                    except ElementClickInterceptedException:
+                        self.driver.execute_script("arguments[0].click();", confirm)
+
+                    # Esperar cierre del modal
+                    self.wait.until(EC.invisibility_of_element_located((By.ID, "cancel-purchase-modal")))
+
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self.driver.close()
+                    except Exception:
+                        pass
+
+            # Regresar a la pestaña de control y cerrar todo
             try:
-                # Abrir modal de “Cancelar compra”
-                cancel_link = self.wait.until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a[data-bs-target='#cancel-purchase-modal']"))
-                )
-                try:
-                    cancel_link.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", cancel_link)
-
-                # Esperar animación del modal
-                self.wait.until(EC.visibility_of_element_located((By.ID, "cancel-purchase-modal")))
-
-                # Confirmar cancelación
-                confirm = self.wait.until(
-                    EC.element_to_be_clickable((
-                        By.CSS_SELECTOR,
-                        "#cancel-purchase-modal .modal-footer a[rel='nofollow'][data-method='post']"
-                    ))
-                )
-                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", confirm)
-                try:
-                    confirm.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", confirm)
-
-                # Esperar cierre del modal
-                self.wait.until(EC.invisibility_of_element_located((By.ID, "cancel-purchase-modal")))
-            except (TimeoutException, NoSuchElementException):
+                self.driver.switch_to.window(control)
+            except Exception:
                 pass
-            finally:
-                self.driver.close()
-
-        # 5) Volver a la principal y cerrar todo
-        self.driver.switch_to.window(control)
-        self.driver.quit()
+            self.driver.quit()
 
     def _discover_tiers(self) -> List[TicketTier]:
-        """
-        Extrae los tiers disponibles (su select ID y nombre).
-        """
+        """Extrae todos los tiers (select ID y nombre)."""
         self.driver.get(self.url)
         tiers: List[TicketTier] = []
         for ticket in self.driver.find_elements(By.CSS_SELECTOR, self.TICKET_CSS):
@@ -217,22 +229,17 @@ class EntradiumScraper:
                 name = f"Entradas de {price_text}€"
             except NoSuchElementException:
                 name = "Tanda sin precio"
-
             sel = ticket.find_elements(By.CSS_SELECTOR, self.SELECT_CSS)
             sel_id = sel[0].get_attribute("id") if sel else None
             tiers.append(TicketTier(id_=sel_id, name=name))
         return tiers
 
     def _scrape_event_info(self) -> Dict[str, str]:
-        """
-        Extrae título, fecha, hora y organizador del evento.
-        """
+        """Extrae título, fecha, hora y organizador."""
         self.driver.get(self.url)
         return {
             "title": self.driver.find_element(By.CSS_SELECTOR, "h1.text-raro mark.bg-crunchy").text.strip(),
-            "date":  self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar")
-                                   .find_element(By.XPATH, "../../span[2]").text.strip(),
-            "time":  self.driver.find_element(By.CSS_SELECTOR, ".icon-clock")
-                                   .find_element(By.XPATH, "../../span[2]").text.strip(),
+            "date":  self.driver.find_element(By.CSS_SELECTOR, ".icon-calendar").find_element(By.XPATH, "../../span[2]").text.strip(),
+            "time":  self.driver.find_element(By.CSS_SELECTOR, ".icon-clock").find_element(By.XPATH, "../../span[2]").text.strip(),
             "organizer": self.driver.find_element(By.CSS_SELECTOR, ".organizer").text.strip(),
         }
